@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ru">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>P2P-calls - Безопасные звонки</title>
+  <meta name="description" content="Прямое соединение без регистрации" />
+
+  <!-- Open Graph / Social Sharing -->
+  <meta property="og:title" content="P2P-calls - Безопасные звонки" />
+  <meta property="og:description" content="Прямое соединение без регистрации" />
+  <meta property="og:image" content="https://p2p-calls.vercel.app/icon-512.png" />
+  <meta property="og:type" content="website" />
+  <meta name="twitter:card" content="summary" />
+
+  <!-- PWA & Icons -->
+  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+  <link rel="apple-touch-icon" href="/icon-192.png" />
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#0088cc" />
+
+  <!-- Telegram Web App SDK -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+
+<body
+  class="bg-zinc-50 dark:bg-zinc-950 sm:bg-zinc-100 sm:dark:bg-zinc-900 flex items-center justify-center p-0 sm:p-4 text-zinc-900 dark:text-zinc-50">
+  <div id="root"
+    class="w-full h-full sm:h-[812px] sm:max-w-[375px] sm:rounded-[40px] shadow-2xl overflow-hidden bg-white dark:bg-zinc-950 border sm:border-zinc-200 sm:dark:border-zinc-800">
+  </div>
+  <script type="module" src="/src/main.tsx"></script>
+</body>
+
+</html>
