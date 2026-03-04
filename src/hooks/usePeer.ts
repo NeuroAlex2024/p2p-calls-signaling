@@ -10,24 +10,42 @@ const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
     autoGainControl: true,
 };
 
-// STUN серверы от нескольких независимых провайдеров — повышают шанс успешного
-// ICE candidate gathering при блокировке Google или медленном ответе.
-// TURN не используется: соединение только прямое P2P.
+// ICE серверы: STUN от нескольких провайдеров + TURN через Open Relay Project (Metered).
+// TURN используется браузером только как fallback когда прямой P2P невозможен
+// (Symmetric NAT, строгие корпоративные файрволы). Трафик сквозь TURN зашифрован
+// DTLS-SRTP — сервер видит только зашифрованные пакеты.
+// Open Relay: бесплатно, 20 GB/мес, без регистрации. https://openrelay.metered.ca
 const ICE_SERVERS: RTCIceServer[] = [
-    // Google (5 серверов)
+    // --- STUN (несколько провайдеров для надёжности) ---
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
     { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun4.l.google.com:19302' },
-    // Cloudflare
     { urls: 'stun:stun.cloudflare.com:3478' },
-    // Mozilla / Standard STUN
     { urls: 'stun:stun.stunprotocol.org:3478' },
-    // Nextcloud (независимый)
-    { urls: 'stun:stun.nextcloud.com:443' },
-    // Freie Universität Berlin
-    { urls: 'stun:stun.fu-berlin.de:3478' },
+    { urls: 'stun:openrelay.metered.ca:80' },
+    // --- TURN / Open Relay Project (fallback при Symmetric NAT) ---
+    {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+    },
+    {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+    },
+    {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+    },
+    {
+        urls: 'turns:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject',
+    },
 ];
 
 const MAX_RETRIES = 3;
