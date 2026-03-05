@@ -10,6 +10,16 @@ const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
     autoGainControl: true,
 };
 
+let cachedMediaStream: MediaStream | null = null;
+
+async function getMediaStream(): Promise<MediaStream> {
+    if (cachedMediaStream && cachedMediaStream.active && cachedMediaStream.getAudioTracks().every(t => t.readyState === 'live')) {
+        return cachedMediaStream;
+    }
+    cachedMediaStream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
+    return cachedMediaStream;
+}
+
 // ICE серверы: STUN от нескольких провайдеров + TURN через Open Relay Project (Metered).
 // TURN используется браузером только как fallback когда прямой P2P невозможен
 // (Symmetric NAT, строгие корпоративные файрволы). Трафик сквозь TURN зашифрован
@@ -53,13 +63,39 @@ const RETRY_BASE_DELAY = 2000; // ms
 const CONNECTION_TIMEOUT = 12000; // ms
 
 /**
+ * "Разблокирует" аудио-выход на Android WebView.
+ * Должна вызываться в цепочке от user gesture (click/tap).
+ * Создаёт AudioContext, делает resume() и играет 1мс тишины —
+ * после этого Android разрешает воспроизведение аудио навсегда.
+ */
+function unlockAudio(): AudioContext {
+    const AC = window.AudioContext || (window as any).webkitAudioContext;
+    const ctx = new AC();
+
+    if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => { });
+    }
+
+    // Играем беззвучный сигнал чтобы снять блокировку
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.001);
+
+    return ctx;
+}
+
+/**
  * Подписывается на iceConnectionState у MediaConnection.
  * - 'failed'      → немедленно вызывает onFailed (звонок невозможен)
  * - 'disconnected'→ запускает таймер: если через 5 с не восстановился → onFailed
  */
 function watchIceState(call: MediaConnection, onFailed: () => void): () => void {
     const pc = call.peerConnection as RTCPeerConnection | undefined;
-    if (!pc) return () => {};
+    if (!pc) return () => { };
 
     let disconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -144,6 +180,7 @@ export const usePeer = () => {
         setPeer,
         setLocalStream,
         setRemoteStream,
+        setAudioContext,
         setStatus,
         setRoomID,
         setError,
@@ -245,6 +282,17 @@ export const usePeer = () => {
             setStatus('linking' as any);
             const id = nanoid(7);
 
+            // APPLE HACK: We MUST request media devices here! 
+            // In iOS Telegram (WKWebView), if we request the microphone inside the `newPeer.on('call')` callback, 
+            // Apple will silently block it because it lacks a direct user gesture. 
+            // Fetching it here solves the "Android connected but Host error" bug.
+            const stream = await getMediaStream();
+            setLocalStream(stream);
+
+            // Android WebView: разблокируем аудио-выход пока мы в цепочке user gesture
+            const audioCtx = unlockAudio();
+            setAudioContext(audioCtx);
+
             const newPeer = await createPeerWithRetry(id);
             setPeer(newPeer);
             setRoomID(newPeer.id);
@@ -258,9 +306,6 @@ export const usePeer = () => {
                 }
 
                 try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
-                    setLocalStream(stream);
-
                     currentCallRef.current = call;
                     call.answer(stream);
 
@@ -329,16 +374,66 @@ export const usePeer = () => {
             setError(message);
             setStatus('error');
         }
-    }, [peer, setPeer, setLocalStream, setRemoteStream, setRoomID, setStatus, setError, setPermissionModal, cleanup, createPeerWithRetry]);
+    }, [peer, setPeer, setLocalStream, setRemoteStream, setRoomID, setStatus, setError, setPermissionModal, setAudioContext, cleanup, createPeerWithRetry]);
 
     const initGuest = useCallback(async (hostId: string) => {
         if (peer) return;
 
         try {
             setStatus('linking' as any);
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
+            const stream = await getMediaStream();
             setLocalStream(stream);
 
+            // Android WebView: разблокируем аудио-выход пока мы в цепочке user gesture
+            const audioCtx = unlockAudio();
+            setAudioContext(audioCtx);
+
+            // RACE CONDITION MAGIC: Attempt to become the HOST first
+            try {
+                const hostPeer = await createPeerWithRetry(hostId);
+                // Success! The ID was free, so we are the host.
+                setPeer(hostPeer);
+                setRoomID(hostId);
+                setStatus('waiting');
+
+                hostPeer.on('call', async (call) => {
+                    if (currentCallRef.current) {
+                        call.close();
+                        return;
+                    }
+                    try {
+                        currentCallRef.current = call;
+                        call.answer(stream);
+                        call.on('stream', (remoteStream) => {
+                            setRemoteStream(remoteStream);
+                            setStatus('connected');
+                        });
+                        watchIceState(call, () => {
+                            console.warn('[ICE] Connection failed on host side');
+                            setError('ICE_FAILED');
+                            cleanup();
+                        });
+                    } catch (e) {
+                        call.close();
+                    }
+                });
+
+                hostPeer.on('disconnected', () => {
+                    hostPeer.reconnect();
+                });
+
+                return; // We successfully became the host! Stop here.
+            } catch (e: any) {
+                if (e && e.type === 'unavailable-id') {
+                    // ID is taken! Someone else is the host. We proceed as Guest.
+                    console.log("[P2P] ID taken, connecting as Guest...");
+                } else {
+                    // Bubble up real errors
+                    throw e;
+                }
+            }
+
+            // GUEST LOGIC
             const newPeer = await createPeerWithRetry();
             setPeer(newPeer);
             setRoomID(hostId);
@@ -421,7 +516,7 @@ export const usePeer = () => {
             setError(message);
             setStatus('error');
         }
-    }, [peer, setPeer, setLocalStream, setRemoteStream, setRoomID, setStatus, setError, setPermissionModal, cleanup, createPeerWithRetry]);
+    }, [peer, setPeer, setLocalStream, setRemoteStream, setRoomID, setStatus, setError, setPermissionModal, setAudioContext, cleanup, createPeerWithRetry]);
 
     useEffect(() => {
         const handleVisibilityChange = () => {

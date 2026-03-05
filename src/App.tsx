@@ -16,9 +16,11 @@ function AppContent() {
       tg.ready();
       tg.expand();
 
-      // Handle startapp parameter for direct room links natively in Telegram
+      // Handle startapp parameter for direct room links natively in Telegram (prevent infinite loop)
       const startParam = tg.initDataUnsafe?.start_param;
-      if (startParam && window.location.pathname === '/') {
+      const isStartParamConsumed = sessionStorage.getItem('startParamConsumed');
+      if (startParam && window.location.pathname === '/' && !isStartParamConsumed) {
+        sessionStorage.setItem('startParamConsumed', 'true');
         navigate(`/room/${startParam}`, { replace: true });
       }
 
