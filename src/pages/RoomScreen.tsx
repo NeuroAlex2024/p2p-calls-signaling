@@ -10,7 +10,7 @@ const isAndroid = /Android/i.test(navigator.userAgent);
 const RoomScreen: React.FC = () => {
     const { id } = useParams<{ id: string }>();
     const navigate = useNavigate();
-    const { initGuest, cleanup } = usePeer();
+    const { initGuest, prewarmGuestConnection, cleanup } = usePeer();
     const {
         status,
         remoteStream,
@@ -23,7 +23,7 @@ const RoomScreen: React.FC = () => {
     } = useCallStore();
 
     const [time, setTime] = useState(0);
-    const [countdown, setCountdown] = useState(15);
+    const [countdown, setCountdown] = useState(10);
     const [waitingJoin, setWaitingJoin] = useState(false);
     const audioRef = useRef<HTMLAudioElement>(null);
     const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -40,6 +40,7 @@ const RoomScreen: React.FC = () => {
             if (status === 'idle' && id) {
                 if (isAndroid) {
                     setWaitingJoin(true);
+                    prewarmGuestConnection(); // Тихо прогреваем вебсокет-слой!
                 } else {
                     initGuest(id);
                 }
@@ -49,9 +50,18 @@ const RoomScreen: React.FC = () => {
                 navigate('/');
             }
         }
-    }, [id, status, initGuest, navigate]);
+    }, [id, status, initGuest, prewarmGuestConnection, navigate]);
 
     const handleJoinCall = () => {
+        // Принудительно регистрируем user gesture для HTMLMediaElement
+        if (audioRef.current) {
+            audioRef.current.volume = 0; // Временно глушим, если начнет зацикливаться
+            audioRef.current.play().catch(() => {
+                // Игнорируем ошибку пустого srcPolicy, жест засчитан браузером
+            });
+            audioRef.current.volume = 1;
+        }
+
         setWaitingJoin(false);
         if (id) initGuest(id);
     };
@@ -73,16 +83,14 @@ const RoomScreen: React.FC = () => {
                 setCountdown((prev) => {
                     if (prev <= 1) {
                         clearInterval(interval);
-                        useCallStore.getState().setError('SERVER_BUSY');
-                        useCallStore.getState().setStatus('error');
-                        cleanup();
+                        cleanup({ error: 'SERVER_BUSY', status: 'error' });
                         return 0;
                     }
                     return prev - 1;
                 });
             }, 1000);
         } else {
-            setCountdown(15);
+            setCountdown(10);
         }
         return () => clearInterval(interval);
     }, [status, cleanup]);
@@ -232,9 +240,9 @@ const RoomScreen: React.FC = () => {
                     </h2>
                     <p className="text-zinc-500 text-sm">
                         {error === 'LINK_INVALID'
-                            ? 'Комната закрыта или ссылка больше не работает.'
+                            ? 'Комната закрыта или хост еще не подключился.'
                             : error === 'SERVER_BUSY'
-                                ? 'К сожалению, сервер занят, создайте комнату заново'
+                                ? 'К сожалению, время ожидания истекло. Создайте комнату заново.'
                                 : error === 'ICE_FAILED'
                                     ? 'Не удалось установить P2P-канал. Попробуйте позвонить снова.'
                                     : 'Не удалось установить соединение. Попробуйте еще раз.'}
@@ -290,7 +298,7 @@ const RoomScreen: React.FC = () => {
                     <ArrowLeft className="w-6 h-6" />
                 </button>
                 <h2 className="flex-1 text-center font-bold text-lg mr-10">
-                    {status === 'connected' ? 'Соединение установлено' : 'Подключение...'}
+                    {status === 'connected' ? 'Соединение установлено' : 'Ожидание собеседника...'}
                 </h2>
             </div>
 
@@ -335,7 +343,7 @@ const RoomScreen: React.FC = () => {
 
                 <div className="text-center space-y-1">
                     <h1 className="text-2xl font-bold tracking-tight">
-                        {status === 'connected' ? 'Собеседник' : 'Поиск пира...'}
+                        {status === 'connected' ? 'Собеседник' : 'Соединение...'}
                     </h1>
                     <p className="text-primary font-medium text-lg min-h-[1.75rem]">
                         {status === 'connected' ? formatTime(time) : `До подключения осталось ${countdown}...`}

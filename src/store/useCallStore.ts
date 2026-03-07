@@ -14,6 +14,7 @@ interface CallState {
     isMuted: boolean;
     isRemoteMuted: boolean;
     showPermissionModal: boolean;
+    isHost: boolean;
 
     // Actions
     setPeer: (peer: Peer | null) => void;
@@ -26,7 +27,8 @@ interface CallState {
     setMuted: (isMuted: boolean) => void;
     setRemoteMuted: (isRemoteMuted: boolean) => void;
     setPermissionModal: (show: boolean) => void;
-    reset: () => void;
+    setIsHost: (isHost: boolean) => void;
+    reset: (overrides?: { error?: string | null; status?: CallStatus }) => void;
 }
 
 export const useCallStore = create<CallState>((set, get) => ({
@@ -40,6 +42,7 @@ export const useCallStore = create<CallState>((set, get) => ({
     isMuted: false,
     isRemoteMuted: false,
     showPermissionModal: false,
+    isHost: false,
 
     setPeer: (peer) => set({ peer }),
     setLocalStream: (localStream) => set({ localStream }),
@@ -51,23 +54,25 @@ export const useCallStore = create<CallState>((set, get) => ({
     setMuted: (isMuted) => set({ isMuted }),
     setRemoteMuted: (isRemoteMuted) => set({ isRemoteMuted }),
     setPermissionModal: (showPermissionModal) => set({ showPermissionModal }),
+    setIsHost: (isHost) => set({ isHost }),
 
-    reset: () => {
+    reset: (overrides?: { error?: string | null; status?: CallStatus }) => {
         const { audioContext } = get();
         if (audioContext && audioContext.state !== 'closed') {
-            audioContext.close().catch(() => {});
+            audioContext.close().catch(() => { });
         }
         set({
             peer: null,
             localStream: null,
             remoteStream: null,
             audioContext: null,
-            status: 'idle',
+            status: overrides?.status ?? 'idle',
             roomID: null,
-            error: null,
+            error: overrides?.error !== undefined ? overrides.error : null,
             isMuted: false,
             isRemoteMuted: false,
             showPermissionModal: false,
+            isHost: false,
         });
     },
 }));

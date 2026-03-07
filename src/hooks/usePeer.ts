@@ -1,8 +1,10 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useCallback } from 'react';
 import { Peer } from 'peerjs';
 import type { MediaConnection, PeerOptions } from 'peerjs';
-import { nanoid } from 'nanoid';
+
 import { useCallStore } from '../store/useCallStore';
+import type { CallStatus } from '../store/useCallStore';
+import { trackEvent } from '../utils/analytics';
 
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
     echoCancellation: true,
@@ -83,7 +85,12 @@ function unlockAudio(): AudioContext {
     osc.connect(gain);
     gain.connect(ctx.destination);
     osc.start();
-    osc.stop(ctx.currentTime + 0.001);
+    // Снимаем блокировку для HTMLMediaElement
+    try {
+        const dummyAudio = new Audio();
+        dummyAudio.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+        dummyAudio.play().catch(() => { });
+    } catch (e) { }
 
     return ctx;
 }
@@ -110,7 +117,7 @@ function watchIceState(call: MediaConnection, onFailed: () => void): () => void 
         const state = pc.iceConnectionState;
         console.log('[ICE]', state);
 
-        if (state === 'failed') {
+        if (state === 'failed' || state === 'closed') {
             clearDisconnectTimer();
             onFailed();
         } else if (state === 'disconnected') {
@@ -174,6 +181,13 @@ function getPeerConfig(): Partial<PeerOptions> {
     };
 }
 
+let currentCallRef: MediaConnection | null = null;
+let isCleaningUpRef = false;
+let prewarmedPeerRef: Peer | null = null;
+let prewarmedHostPeerRef: Peer | null = null;
+let prewarmedHostPromiseRef: Promise<Peer> | null = null;
+let pendingHostCallRef: MediaConnection | null = null;
+
 export const usePeer = () => {
     const {
         peer,
@@ -185,31 +199,49 @@ export const usePeer = () => {
         setRoomID,
         setError,
         setPermissionModal,
-        reset,
     } = useCallStore();
 
-    const currentCallRef = useRef<MediaConnection | null>(null);
-    const retriesRef = useRef(0);
-    const isCleaningUpRef = useRef(false);
+    const cleanup = useCallback((finalState?: { error?: string; status?: CallStatus }) => {
+        if (isCleaningUpRef) return;
+        isCleaningUpRef = true;
 
-    const cleanup = useCallback(() => {
-        if (isCleaningUpRef.current) return;
-        isCleaningUpRef.current = true;
+        const state = useCallStore.getState();
 
-        if (currentCallRef.current) {
-            currentCallRef.current.close();
-            currentCallRef.current = null;
+        // 1. Немедленно останавливаем свои треки (чтобы другая сторона сразу поняла что звонок окончен)
+        if (state.localStream) {
+            state.localStream.getTracks().forEach(track => track.stop());
+        }
+        if (cachedMediaStream) {
+            cachedMediaStream.getTracks().forEach(track => track.stop());
+            cachedMediaStream = null;
         }
 
-        const currentPeer = useCallStore.getState().peer;
+        // 2. Закрываем звонок
+        if (currentCallRef) {
+            currentCallRef.close();
+            currentCallRef = null;
+        }
+
+        const currentPeer = state.peer;
         if (currentPeer && !currentPeer.destroyed) {
             currentPeer.destroy();
         }
 
-        reset();
-        retriesRef.current = 0;
-        isCleaningUpRef.current = false;
-    }, [reset]);
+        if (prewarmedPeerRef && !prewarmedPeerRef.destroyed) {
+            prewarmedPeerRef.destroy();
+            prewarmedPeerRef = null;
+        }
+
+        if (prewarmedHostPeerRef && !prewarmedHostPeerRef.destroyed) {
+            prewarmedHostPeerRef.destroy();
+            prewarmedHostPeerRef = null;
+        }
+        prewarmedHostPromiseRef = null;
+        pendingHostCallRef = null;
+
+        state.reset(finalState);
+        isCleaningUpRef = false;
+    }, []);
 
     /** Create a Peer with retry logic */
     const createPeerWithRetry = useCallback(
@@ -240,7 +272,6 @@ export const usePeer = () => {
 
                     const onOpen = () => {
                         clearTimeout(timeout);
-                        retriesRef.current = 0;
                         newPeer.off('open', onOpen);
                         newPeer.off('error', onError);
                         resolve(newPeer);
@@ -275,68 +306,140 @@ export const usePeer = () => {
         [],
     );
 
-    const initHost = useCallback(async () => {
-        if (peer) return;
+    const prewarmGuestConnection = useCallback(() => {
+        if (prewarmedPeerRef) return;
+        createPeerWithRetry().then(peer => {
+            if (!isCleaningUpRef) {
+                prewarmedPeerRef = peer;
+            } else {
+                peer.destroy();
+            }
+        }).catch((e) => {
+            console.warn('[PeerJS] Prewarm failed:', e);
+        });
+    }, [createPeerWithRetry]);
+
+    const prewarmHostConnection = useCallback((id: string) => {
+        if (prewarmedHostPeerRef || prewarmedHostPromiseRef) return;
+        const promise = createPeerWithRetry(id);
+        prewarmedHostPromiseRef = promise;
+
+        promise.then(peer => {
+            if (!isCleaningUpRef) {
+                prewarmedHostPeerRef = peer;
+                peer.on('call', (call) => {
+                    console.log('[PeerJS] Received early call during prewarm!');
+                    pendingHostCallRef = call;
+                });
+            } else {
+                peer.destroy();
+            }
+        }).catch((e) => {
+            console.warn('[PeerJS] Host Prewarm failed:', e);
+        }).finally(() => {
+            prewarmedHostPromiseRef = null;
+        });
+    }, [createPeerWithRetry]);
+
+    const startHostSession = useCallback(async (roomId: string) => {
+        if (peer || useCallStore.getState().status === 'linking') return;
 
         try {
             setStatus('linking' as any);
-            const id = nanoid(7);
+            useCallStore.getState().setIsHost(true);
 
-            // APPLE HACK: We MUST request media devices here! 
-            // In iOS Telegram (WKWebView), if we request the microphone inside the `newPeer.on('call')` callback, 
-            // Apple will silently block it because it lacks a direct user gesture. 
-            // Fetching it here solves the "Android connected but Host error" bug.
-            const stream = await getMediaStream();
-            setLocalStream(stream);
-
-            // Android WebView: разблокируем аудио-выход пока мы в цепочке user gesture
+            // Android WebView: разблокируем аудио-выход СРАЗУ, ДО любых async/await
             const audioCtx = unlockAudio();
             setAudioContext(audioCtx);
 
-            const newPeer = await createPeerWithRetry(id);
+            // Start fetching media stream in parallel with network connection
+            // We do NOT await it here to save 1-2 seconds on room creation
+            const streamPromise = getMediaStream().then(stream => {
+                setLocalStream(stream);
+                // ── АНАЛИТИКА: mic_allowed (хост выдал доступ к микрофону) ──
+                trackEvent('mic_allowed', { room_id: roomId });
+                return stream;
+            }).catch(err => {
+                console.error('[PeerJS] Media error during parallel stream fetch:', err);
+                if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                    setPermissionModal(true);
+                }
+                cleanup();
+                setError('MEDIA_REFUSED');
+                setStatus('error');
+                throw err;
+            });
+
+            let newPeer = prewarmedHostPeerRef;
+            if (!newPeer && prewarmedHostPromiseRef) {
+                try {
+                    newPeer = await prewarmedHostPromiseRef;
+                } catch (e) {
+                    console.warn('[PeerJS] Prewarm promise failed during session start:', e);
+                }
+            }
+
+            if (newPeer && !newPeer.destroyed && newPeer.open && newPeer.id === roomId) {
+                prewarmedHostPeerRef = null;
+            } else {
+                if (newPeer) newPeer.destroy();
+                newPeer = await createPeerWithRetry(roomId);
+            }
+
             setPeer(newPeer);
-            setRoomID(newPeer.id);
+            setRoomID(roomId);
             setStatus('waiting');
 
-            // Listen for incoming calls
-            newPeer.on('call', async (call) => {
-                if (currentCallRef.current) {
+            const handleCall = async (call: MediaConnection) => {
+                if (currentCallRef) {
                     call.close();
                     return;
                 }
 
                 try {
-                    currentCallRef.current = call;
+                    currentCallRef = call;
+
+                    // Await the parallel stream promise. If it was already resolved, it proceeds instantly
+                    const stream = await streamPromise;
+
                     call.answer(stream);
 
                     call.on('stream', (remoteStream) => {
                         setRemoteStream(remoteStream);
                         setStatus('connected');
+                        // ── АНАЛИТИКА: call_started (WebRTC установлен на стороне хоста) ──
+                        trackEvent('call_started', { room_id: roomId });
+                        remoteStream.getTracks().forEach(track => {
+                            track.onended = () => {
+                                console.log('[PeerJS] Remote track ended (host) - hanging up');
+                                cleanup();
+                            };
+                        });
                     });
 
                     // Мониторинг ICE: если соединение упало — завершаем звонок с ошибкой
                     watchIceState(call, () => {
                         console.warn('[ICE] Connection failed on host side');
-                        setError('ICE_FAILED');
-                        cleanup();
+                        trackEvent('call_failed', { room_id: roomId, reason: 'ICE_FAILED' });
+                        cleanup({ error: 'ICE_FAILED', status: 'error' });
                     });
 
-                    call.on('close', () => {
-                        cleanup();
-                    });
-
-                    call.on('error', (err) => {
-                        console.error('[PeerJS] Call error (host):', err);
-                        cleanup();
-                    });
+                    call.on('close', () => cleanup());
+                    call.on('error', () => cleanup());
                 } catch (mediaErr: any) {
-                    console.error('[PeerJS] Media error:', mediaErr);
-                    if (mediaErr.name === 'NotAllowedError' || mediaErr.name === 'PermissionDeniedError') {
-                        setPermissionModal(true);
-                    }
+                    console.error('[PeerJS] Call runtime error:', mediaErr);
                     call.close();
                 }
-            });
+            };
+
+            // Listen for incoming calls
+            newPeer.on('call', handleCall);
+
+            if (pendingHostCallRef) {
+                console.log('[PeerJS] Answering pending call!');
+                handleCall(pendingHostCallRef);
+                pendingHostCallRef = null;
+            }
 
             // Post-open error handling (e.g. peer-unavailable for guests)
             newPeer.on('error', (err) => {
@@ -355,7 +458,7 @@ export const usePeer = () => {
             newPeer.on('disconnected', () => {
                 console.log('[PeerJS] Disconnected from signaling server');
                 // Only try to reconnect if we haven't cleaned up
-                if (!newPeer.destroyed && !isCleaningUpRef.current) {
+                if (!newPeer.destroyed && !isCleaningUpRef) {
                     console.log('[PeerJS] Attempting reconnect...');
                     newPeer.reconnect();
                 }
@@ -363,7 +466,7 @@ export const usePeer = () => {
 
             newPeer.on('close', () => {
                 console.log('[PeerJS] Peer connection closed');
-                if (!isCleaningUpRef.current) {
+                if (!isCleaningUpRef) {
                     cleanup();
                 }
             });
@@ -371,38 +474,41 @@ export const usePeer = () => {
         } catch (err: any) {
             console.error('[PeerJS] Init host error:', err);
             const message = err.message === 'SERVER_TIMEOUT' ? 'SERVER_TIMEOUT' : 'CONNECTION_ERROR';
+            cleanup();
             setError(message);
             setStatus('error');
         }
     }, [peer, setPeer, setLocalStream, setRemoteStream, setRoomID, setStatus, setError, setPermissionModal, setAudioContext, cleanup, createPeerWithRetry]);
 
     const initGuest = useCallback(async (hostId: string) => {
-        if (peer) return;
+        if (peer || useCallStore.getState().status === 'linking') return;
 
         try {
             setStatus('linking' as any);
-            const stream = await getMediaStream();
-            setLocalStream(stream);
 
-            // Android WebView: разблокируем аудио-выход пока мы в цепочке user gesture
+            // Android WebView: разблокируем аудио-выход СРАЗУ, ДО любых async/await
             const audioCtx = unlockAudio();
             setAudioContext(audioCtx);
 
-            // RACE CONDITION MAGIC: Attempt to become the HOST first
+            const stream = await getMediaStream();
+            setLocalStream(stream);
+            // ── АНАЛИТИКА: mic_allowed (гость выдал доступ к микрофону) ──
+            trackEvent('mic_allowed', { room_id: hostId });
             try {
                 const hostPeer = await createPeerWithRetry(hostId);
                 // Success! The ID was free, so we are the host.
+                useCallStore.getState().setIsHost(true);
                 setPeer(hostPeer);
                 setRoomID(hostId);
                 setStatus('waiting');
 
                 hostPeer.on('call', async (call) => {
-                    if (currentCallRef.current) {
+                    if (currentCallRef) {
                         call.close();
                         return;
                     }
                     try {
-                        currentCallRef.current = call;
+                        currentCallRef = call;
                         call.answer(stream);
                         call.on('stream', (remoteStream) => {
                             setRemoteStream(remoteStream);
@@ -410,8 +516,8 @@ export const usePeer = () => {
                         });
                         watchIceState(call, () => {
                             console.warn('[ICE] Connection failed on host side');
-                            setError('ICE_FAILED');
-                            cleanup();
+                            trackEvent('call_failed', { room_id: hostId, reason: 'ICE_FAILED' });
+                            cleanup({ error: 'ICE_FAILED', status: 'error' });
                         });
                     } catch (e) {
                         call.close();
@@ -434,52 +540,81 @@ export const usePeer = () => {
             }
 
             // GUEST LOGIC
-            const newPeer = await createPeerWithRetry();
+            useCallStore.getState().setIsHost(false);
+
+            let newPeer = prewarmedPeerRef;
+            if (newPeer && !newPeer.destroyed && newPeer.open) {
+                prewarmedPeerRef = null;
+            } else {
+                if (newPeer) newPeer.destroy();
+                newPeer = await createPeerWithRetry();
+            }
+
             setPeer(newPeer);
             setRoomID(hostId);
 
-            const call = newPeer.call(hostId, stream);
-            if (!call) {
-                throw new Error('LINK_INVALID');
-            }
-            currentCallRef.current = call;
+            let pollingTimer: ReturnType<typeof setTimeout> | null = null;
+            let retryCount = 0;
 
-            call.on('stream', (remoteStream) => {
-                setRemoteStream(remoteStream);
-                setStatus('connected');
-            });
+            const connectToHost = () => {
+                if (isCleaningUpRef || !newPeer || newPeer.destroyed) return;
 
-            // Мониторинг ICE: если соединение упало — завершаем звонок с ошибкой
-            watchIceState(call, () => {
-                console.warn('[ICE] Connection failed on guest side');
-                setError('ICE_FAILED');
-                cleanup();
-            });
+                const call = newPeer.call(hostId, stream);
+                if (!call) return;
 
-            call.on('error', (err) => {
-                console.error('[PeerJS] Call error (guest):', err);
-                const currentStatus = useCallStore.getState().status;
-                if (currentStatus === 'connected' || currentStatus === 'waiting') {
-                    cleanup();
-                } else {
-                    setError('CONNECTION_ERROR');
-                    setStatus('error');
-                }
-            });
+                currentCallRef = call;
 
-            call.on('close', () => {
-                cleanup();
-            });
+                call.on('stream', (remoteStream) => {
+                    if (pollingTimer) clearTimeout(pollingTimer);
+                    setRemoteStream(remoteStream);
+                    setStatus('connected');
+                    // ── АНАЛИТИКА: call_started (WebRTC установлен на стороне гостя) ──
+                    trackEvent('call_started', { room_id: hostId });
+                    remoteStream.getTracks().forEach(track => {
+                        track.onended = () => {
+                            console.log('[PeerJS] Remote track ended (guest) - hanging up');
+                            cleanup();
+                        };
+                    });
+                });
+
+                watchIceState(call, () => {
+                    console.warn('[ICE] Connection failed on guest side');
+                    trackEvent('call_failed', { room_id: hostId, reason: 'ICE_FAILED' });
+                    cleanup({ error: 'ICE_FAILED', status: 'error' });
+                });
+
+                call.on('error', (err) => {
+                    console.error('[PeerJS] Call error (guest):', err);
+                    const currentStatus = useCallStore.getState().status;
+                    if (currentStatus === 'connected' || currentStatus === 'waiting') {
+                        cleanup();
+                    }
+                });
+
+                call.on('close', () => {
+                    if (useCallStore.getState().status === 'connected') {
+                        cleanup();
+                    }
+                });
+            };
+
+            connectToHost();
 
             // Post-open error handling
             newPeer.on('error', (err) => {
                 console.error('[PeerJS] Guest runtime error:', err.type, err.message);
                 if (err.type === 'peer-unavailable') {
                     const currentStatus = useCallStore.getState().status;
-                    if (currentStatus === 'connected' || currentStatus === 'waiting') {
+                    if (currentStatus === 'connected') {
                         cleanup();
+                    } else if (retryCount < 4) { // ~12 seconds polling
+                        retryCount++;
+                        console.log(`[PeerJS] Host not found yet, retrying (attempt ${retryCount})...`);
+                        setStatus('linking' as any);
+                        pollingTimer = setTimeout(connectToHost, 3000);
                     } else {
-                        setError('LINK_INVALID');
+                        setError('SERVER_TIMEOUT');
                         setStatus('error');
                         if (!newPeer.destroyed) newPeer.destroy();
                     }
@@ -491,13 +626,13 @@ export const usePeer = () => {
             });
 
             newPeer.on('disconnected', () => {
-                if (!newPeer.destroyed && !isCleaningUpRef.current) {
+                if (!newPeer.destroyed && !isCleaningUpRef) {
                     newPeer.reconnect();
                 }
             });
 
             newPeer.on('close', () => {
-                if (!isCleaningUpRef.current) {
+                if (!isCleaningUpRef) {
                     cleanup();
                 }
             });
@@ -513,6 +648,7 @@ export const usePeer = () => {
             if (err.message === 'SERVER_TIMEOUT') message = 'SERVER_TIMEOUT';
             if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') message = 'MEDIA_REFUSED';
 
+            cleanup();
             setError(message);
             setStatus('error');
         }
@@ -537,5 +673,5 @@ export const usePeer = () => {
         };
     }, []);
 
-    return { initHost, initGuest, cleanup };
+    return { startHostSession, initGuest, prewarmGuestConnection, prewarmHostConnection, cleanup };
 };

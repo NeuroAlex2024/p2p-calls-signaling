@@ -2,8 +2,10 @@ import { BrowserRouter as Router, Routes, Route, useNavigate } from 'react-route
 import { useEffect } from 'react';
 import MainScreen from './pages/MainScreen.tsx';
 import RoomScreen from './pages/RoomScreen.tsx';
+import StatisticPage from './pages/StatisticPage.tsx';
 import PermissionModal from './components/PermissionModal';
 import { useCallStore } from './store/useCallStore';
+import { trackEvent } from './utils/analytics';
 
 function AppContent() {
   const showPermissionModal = useCallStore((state) => state.showPermissionModal);
@@ -16,11 +18,16 @@ function AppContent() {
       tg.ready();
       tg.expand();
 
+      // ── АНАЛИТИКА: app_opened ─────────────────────────────────────────────
+      trackEvent('app_opened');
+
       // Handle startapp parameter for direct room links natively in Telegram (prevent infinite loop)
       const startParam = tg.initDataUnsafe?.start_param;
       const isStartParamConsumed = sessionStorage.getItem('startParamConsumed');
       if (startParam && window.location.pathname === '/' && !isStartParamConsumed) {
         sessionStorage.setItem('startParamConsumed', 'true');
+        // ── АНАЛИТИКА: guest_joined (пользователь пришёл по инвайт-ссылке) ──
+        trackEvent('guest_joined', { room_id: startParam });
         navigate(`/room/${startParam}`, { replace: true });
       }
 
@@ -54,6 +61,7 @@ function AppContent() {
       <Routes>
         <Route path="/" element={<MainScreen />} />
         <Route path="/room/:id" element={<RoomScreen />} />
+        <Route path="/statistic" element={<StatisticPage />} />
       </Routes>
       <PermissionModal isOpen={showPermissionModal} />
     </div>
